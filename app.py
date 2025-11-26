@@ -2,179 +2,143 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error, r2_score
 
-# Cek scikit-learn
-try:
-    from sklearn.ensemble import RandomForestRegressor
-    from sklearn.model_selection import train_test_split
-    from sklearn.metrics import mean_squared_error, r2_score
-except ModuleNotFoundError:
-    st.error("❌ scikit-learn belum terinstal. Tambahkan 'scikit-learn' pada requirements.txt")
-    st.stop()
+st.set_page_config(page_title="📊 Dashboard Prediksi Iklim", layout="wide")
 
-# Judul
-st.title("🌦️ Prediksi Iklim Indonesia (Tanpa Upload + Dengan Upload)")
-st.write("Aplikasi tetap berjalan meskipun Anda tidak mengunggah file.")
+# ========== 1️⃣ LOAD DATA ==========
+@st.cache_data
+def load_data():
+    df = pd.read_excel("DATA BMKG_JAKARTA PUSAT 2015-2025.xlsx", sheet_name="Data Harian - Table")
+    df = df.loc[:, ~df.columns.duplicated()]
+    if "kecepatan_angin" in df.columns:
+        df = df.rename(columns={"kecepatan_angin":"FF_X"})
+    df["Tanggal"] = pd.to_datetime(df["Tanggal"], dayfirst=True)
+    df["Tahun"] = df["Tanggal"].dt.year
+    df["Bulan"] = df["Tanggal"].dt.month
+    return df
 
-# ============================================================
-# 1. PILIHAN DATA: UPLOAD ATAU AUTO
-# ============================================================
-uploaded_file = st.file_uploader("Unggah file Excel (.xlsx)", type=["xlsx"])
+df = load_data()
 
-if uploaded_file:
-    df = pd.read_excel(uploaded_file, sheet_name="Data Harian - Table")
-    st.success("📁 Data berhasil di-load dari upload!")
-else:
-    st.warning("⚠️ Anda belum upload file — memakai DATA CONTOH otomatis.")
-    
-    # ============================================================
-    # DATA DEFAULT (DUMMY) — TIDAK PERLU FILE LAGI
-    # ============================================================
-    date_rng = pd.date_range(start="2010-01-01", end="2024-12-31", freq="D")
-    np.random.seed(42)
+wilayah = "Jakarta Pusat"
+st.title(f"🌦️ Dashboard Analisis & Prediksi Iklim — {wilayah}")
 
-    df = pd.DataFrame({
-        "Tanggal": date_rng,
-        "Tn": np.random.uniform(20, 25, len(date_rng)),
-        "Tx": np.random.uniform(28, 34, len(date_rng)),
-        "Tavg": np.random.uniform(24, 29, len(date_rng)),
-        "kelembaban": np.random.uniform(60, 95, len(date_rng)),
-        "curah_hujan": np.random.uniform(0, 20, len(date_rng)),
-        "matahari": np.random.uniform(2, 10, len(date_rng)),
-        "FF_X": np.random.uniform(1, 10, len(date_rng)),
-        "DDD_X": np.random.uniform(0, 360, len(date_rng)),
-    })
 
-# ============================================================
-# 2. PRA-PROSES DATA
-# ============================================================
-df = df.loc[:, ~df.columns.duplicated()]
+# ========== 2️⃣ Sidebar Filter ==========
+st.sidebar.header("🔎 Filter Data")
 
-df['Tanggal'] = pd.to_datetime(df['Tanggal'])
-df['Tahun'] = df['Tanggal'].dt.year
-df['Bulan'] = df['Tanggal'].dt.month
+selected_year = st.sidebar.multiselect(
+    "Pilih Tahun",
+    sorted(df["Tahun"].unique()),
+    default=df["Tahun"].unique()
+)
 
-# Variabel utama
-possible_vars = ["Tn", "Tx", "Tavg", "kelembaban", "curah_hujan", "matahari", "FF_X", "DDD_X"]
+selected_month = st.sidebar.multiselect(
+    "Pilih Bulan",
+    range(1, 13),
+    default=range(1, 13)
+)
+
+df = df[df["Tahun"].isin(selected_year)]
+df = df[df["Bulan"].isin(selected_month)]
+
+possible_vars = ["Tn","Tx","Tavg","kelembaban","curah_hujan","matahari","FF_X","DDD_X"]
 available_vars = [v for v in possible_vars if v in df.columns]
 
-akademis_label = {
+label = {
     "Tn": "Suhu Minimum (°C)",
     "Tx": "Suhu Maksimum (°C)",
     "Tavg": "Suhu Rata-rata (°C)",
-    "kelembaban": "Kelembaban Udara (%)",
+    "kelembaban": "Kelembaban (%)",
     "curah_hujan": "Curah Hujan (mm)",
-    "matahari": "Durasi Penyinaran Matahari (jam)",
-    "FF_X": "Kecepatan Angin Maksimum (m/s)",
-    "DDD_X": "Arah Angin Maksimum (°)"
+    "matahari": "Durasi Matahari (jam)",
+    "FF_X": "Kecepatan Angin (m/s)",
+    "DDD_X": "Arah Angin (°)"
 }
 
-# ============================================================
-# 3. AGREGASI BULANAN
-# ============================================================
-agg_dict = {v: 'mean' for v in available_vars}
-agg_dict["curah_hujan"] = "sum"
+# ========== 3️⃣ Agregasi ==========
+agg_dict = {v:"mean" for v in available_vars}
+if "curah_hujan" in available_vars:
+    agg_dict["curah_hujan"] = "sum"
 
-monthly_df = df.groupby(['Tahun', 'Bulan']).agg(agg_dict).reset_index()
+monthly = df.groupby(["Tahun","Bulan"]).agg(agg_dict).reset_index()
 
-st.subheader("📊 Data Bulanan")
-st.dataframe(monthly_df.head(20))
 
-# ============================================================
-# 4. TRAIN MODEL
-# ============================================================
-X = monthly_df[['Tahun', 'Bulan']]
+# ========== 4️⃣ Model ==========
 models = {}
 metrics = {}
 
-for var in available_vars:
-    y = monthly_df[var]
+for v in available_vars:
+    X = monthly[["Tahun","Bulan"]]
+    y = monthly[v]
 
-    if len(y) < 5:
-        continue
+    Xtr, Xts, ytr, yts = train_test_split(X, y, test_size=0.2, random_state=42)
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
-    )
+    m = RandomForestRegressor(n_estimators=180, random_state=42)
+    m.fit(Xtr,ytr)
+    pred = m.predict(Xts)
 
-    model = RandomForestRegressor(n_estimators=200, random_state=42)
-    model.fit(X_train, y_train)
+    models[v] = m
+    metrics[v] = (mean_squared_error(yts,pred)**0.5, r2_score(yts,pred))
 
-    pred = model.predict(X_test)
+# ========== 5️⃣ Card Statistik ==========
+c1,c2,c3 = st.columns(3)
+c1.metric("📏 Data Historis", f"{len(df):,} record")
+c2.metric("📅 Rentang Tahun", f"{df['Tahun'].min()} - {df['Tahun'].max()}")
+c3.metric("📦 Variabel Iklim", len(available_vars))
 
-    models[var] = model
-    metrics[var] = {
-        "rmse": np.sqrt(mean_squared_error(y_test, pred)),
-        "r2": r2_score(y_test, pred)
-    }
 
-# ============================================================
-# 5. EVALUASI
-# ============================================================
-st.subheader("📈 Evaluasi Model")
-for var in models.keys():
-    m = metrics[var]
-    st.write(f"**{akademis_label[var]}** — RMSE: {m['rmse']:.3f} | R²: {m['r2']:.3f}")
+# ========== 6️⃣ Grafik Tren ==========
+st.subheader("📈 Tren Data Historis")
+var_plot = st.selectbox("Pilih Variabel", [label[v] for v in available_vars])
 
-# ============================================================
-# 6. PREDIKSI MANUAL
-# ============================================================
-st.subheader("🔮 Prediksi Manual")
-tahun_input = st.number_input("Tahun", 2025, 2100, 2035)
-bulan_input = st.selectbox("Bulan", list(range(1, 13)))
+key = [k for k,v in label.items() if v==var_plot][0]
 
-input_df = pd.DataFrame([[tahun_input, bulan_input]], columns=["Tahun", "Bulan"])
-
-for var in models.keys():
-    pred_val = models[var].predict(input_df)[0]
-    st.success(f"{akademis_label[var]} bulan {bulan_input}/{tahun_input}: **{pred_val:.2f}**")
-
-# ============================================================
-# 7. PREDIKSI 2025–2075
-# ============================================================
-years = list(range(2025, 2076))
-months = list(range(1, 13))
-future_df = pd.DataFrame([(y, m) for y in years for m in months], columns=["Tahun", "Bulan"])
-
-for var in models.keys():
-    future_df[f"Pred_{var}"] = models[var].predict(future_df[['Tahun', 'Bulan']])
-
-# ============================================================
-# 8. GRAFIK
-# ============================================================
-st.subheader("📈 Grafik Prediksi")
-
-monthly_df['Sumber'] = 'Historis'
-future_df['Sumber'] = 'Prediksi'
-
-gabungan = []
-
-for var in models.keys():
-    h = monthly_df[['Tahun', 'Bulan', var, 'Sumber']].rename(columns={var: "Nilai"})
-    h['Variabel'] = akademis_label[var]
-
-    p = future_df[['Tahun', 'Bulan', f"Pred_{var}", 'Sumber']].rename(columns={f"Pred_{var}": "Nilai"})
-    p['Variabel'] = akademis_label[var]
-
-    gabungan.append(pd.concat([h, p]))
-
-merged = pd.concat(gabungan)
-merged['Tanggal'] = pd.to_datetime(merged['Tahun'].astype(str) + "-" + merged['Bulan'].astype(str) + "-01")
-
-pilih_var = st.selectbox("Pilih Variabel", list(akademis_label[v] for v in models.keys()))
-
-fig = px.line(
-    merged[merged["Variabel"] == pilih_var],
-    x="Tanggal",
-    y="Nilai",
-    color="Sumber",
-    title=f"Tren {pilih_var} (Historis vs Prediksi)"
+monthly["Tanggal"] = pd.to_datetime(
+    monthly["Tahun"].astype(str)+"-"+monthly["Bulan"].astype(str)+"-01"
 )
-st.plotly_chart(fig, use_container_width=True)
 
-# ============================================================
-# 9. DOWNLOAD
-# ============================================================
-st.subheader("💾 Download Prediksi 2025–2075")
-csv = future_df.to_csv(index=False).encode("utf-8")
-st.download_button("📥 Download CSV", csv, "prediksi_2025_2075.csv", "text/csv")
+fig1 = px.line(
+    monthly,
+    x="Tanggal",
+    y=key,
+    markers=True,
+    title=var_plot,
+    template="plotly_white"
+)
+st.plotly_chart(fig1, use_container_width=True)
+
+
+# ========== 7️⃣ Prediksi 50 Tahun ==========
+future = pd.DataFrame([(y,m) for y in range(2025,2076) for m in range(1,13)], columns=["Tahun","Bulan"])
+for v in available_vars:
+    future[f"Pred_{v}"] = models[v].predict(future[["Tahun","Bulan"]])
+
+st.subheader("🔮 Prediksi 2025–2075")
+var_pred = st.selectbox("Pilih Variabel Prediksi", [label[v] for v in available_vars])
+
+key2 = [k for k,v in label.items() if v==var_pred][0]
+future["Tanggal"] = pd.to_datetime(
+    future["Tahun"].astype(str)+"-"+future["Bulan"].astype(str)+"-01"
+)
+
+fig2 = px.line(
+    future,
+    x="Tanggal",
+    y=f"Pred_{key2}",
+    title=f"Prediksi {var_pred}",
+    template="plotly_white"
+)
+st.plotly_chart(fig2, use_container_width=True)
+
+
+# ========== 8️⃣ Download ==========
+csv = future.to_csv(index=False).encode("utf8")
+st.download_button(
+    "📥 Download Dataset Prediksi",
+    data=csv,
+    file_name="prediksi_jawa_timur.csv",
+    mime="text/csv"
+)
